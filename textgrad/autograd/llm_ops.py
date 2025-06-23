@@ -5,6 +5,83 @@ from textgrad.variable import Variable
 from textgrad.engine import EngineLM
 from textgrad.config import validate_engine_or_get_default
 from typing import List
+import time
+import random
+import os
+
+
+# Retry configuration
+MAX_RETRY_ATTEMPTS = int(os.getenv("TEXTGRAD_MAX_RETRY_ATTEMPTS", "3"))
+RETRY_BASE_DELAY = float(os.getenv("TEXTGRAD_RETRY_BASE_DELAY", "1.0"))
+RETRY_MAX_DELAY = float(os.getenv("TEXTGRAD_RETRY_MAX_DELAY", "10.0"))
+
+
+class RetryableError(Exception):
+    """Exception that indicates the operation should be retried."""
+    pass
+
+
+class NonRetryableError(Exception):
+    """Exception that indicates the operation should not be retried."""
+    pass
+
+
+def exponential_backoff(attempt: int, base_delay: float = RETRY_BASE_DELAY, max_delay: float = RETRY_MAX_DELAY) -> float:
+    """Calculate exponential backoff delay with jitter."""
+    delay = min(base_delay * (2 ** attempt), max_delay)
+    # Add jitter to avoid thundering herd
+    jitter = random.uniform(0.1, 0.3) * delay
+    return delay + jitter
+
+
+def retry_llm_call(func):
+    """Decorator to retry LLM calls with exponential backoff."""
+    def wrapper(*args, **kwargs):
+        last_exception = None
+        
+        for attempt in range(MAX_RETRY_ATTEMPTS):
+            try:
+                result = func(*args, **kwargs)
+                
+                # Check if result is None (the main issue we're fixing)
+                if result is None:
+                    error_msg = f"LLM call returned None (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS})"
+                    logger.warning(error_msg, extra={"function": func.__name__, "attempt": attempt + 1})
+                    if attempt < MAX_RETRY_ATTEMPTS - 1:
+                        delay = exponential_backoff(attempt)
+                        time.sleep(delay)
+                        continue
+                    else:
+                        raise RetryableError(f"LLM call returned None after {MAX_RETRY_ATTEMPTS} attempts")
+                
+                # Success case
+                if attempt > 0:
+                    logger.info(f"LLM call succeeded after {attempt + 1} attempts", 
+                              extra={"function": func.__name__, "attempts": attempt + 1})
+                return result
+                
+            except NonRetryableError:
+                # Don't retry these errors
+                raise
+            except Exception as e:
+                last_exception = e
+                error_msg = f"LLM call failed (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS}): {str(e)}"
+                
+                if attempt < MAX_RETRY_ATTEMPTS - 1:
+                    logger.warning(error_msg, extra={"function": func.__name__, "attempt": attempt + 1, "error": str(e)})
+                    delay = exponential_backoff(attempt)
+                    time.sleep(delay)
+                else:
+                    logger.error(f"LLM call failed permanently after {MAX_RETRY_ATTEMPTS} attempts", 
+                               extra={"function": func.__name__, "error": str(e)})
+                    break
+        
+        # If we get here, all retries failed
+        raise Exception(f"LLM call failed after {MAX_RETRY_ATTEMPTS} attempts. Last error: {str(last_exception)}") from last_exception
+    
+    return wrapper
+
+
 from .llm_backward_prompts import (
     EVALUATE_VARIABLE_INSTRUCTION,
     CONVERSATION_START_INSTRUCTION_BASE,
@@ -56,8 +133,8 @@ class LLMCall(Function):
         # TODO: Should we allow default roles? It will make things less performant.
         system_prompt_value = self.system_prompt.value if self.system_prompt else None
 
-        # Make the LLM Call
-        response_text = self.engine(input_variable.value, system_prompt=system_prompt_value)
+        # Make the LLM Call with retry mechanism
+        response_text = self._call_engine_with_retry(input_variable.value, system_prompt_value)
 
         # Create the response variable
         response = Variable(
@@ -223,6 +300,31 @@ class LLMCall(Function):
                 var_gradients._reduce_meta.extend(response._reduce_meta)
                 variable._reduce_meta.extend(response._reduce_meta)
 
+    @retry_llm_call
+    def _call_engine_with_retry(self, prompt: str, system_prompt: str = None):
+        """Call the engine with retry mechanism for robustness."""
+        try:
+            response = self.engine(prompt, system_prompt=system_prompt)
+            
+            # Validate response
+            if response is None:
+                raise RetryableError("Engine returned None response")
+            
+            if not isinstance(response, str):
+                raise RetryableError(f"Engine returned non-string response: {type(response)}")
+            
+            return response
+            
+        except Exception as e:
+            # Log the error with context
+            logger.error(f"Engine call failed", extra={
+                "engine": str(self.engine),
+                "prompt_length": len(prompt) if prompt else 0,
+                "system_prompt_length": len(system_prompt) if system_prompt else 0,
+                "error": str(e)
+            })
+            raise
+
 
 
 class FormattedLLMCall(LLMCall):
@@ -272,8 +374,8 @@ class FormattedLLMCall(LLMCall):
         # TODO: Should we allow default roles? It will make things less performant.
         system_prompt_value = self.system_prompt.value if self.system_prompt else None
 
-        # Make the LLM Call
-        response_text = self.engine(formatted_input_string, system_prompt=system_prompt_value)
+        # Make the LLM Call with retry mechanism
+        response_text = self._call_engine_with_retry(formatted_input_string, system_prompt_value)
 
         # Create the response variable
         response = Variable(
@@ -318,13 +420,21 @@ class LLMCall_with_in_context_examples(LLMCall):
         # TODO: Should we allow default roles? It will make things less performant.
         system_prompt_value = self.system_prompt.value if self.system_prompt else None
 
-        # Make the LLM Call
-        response_text = self.engine(input_variable.value, system_prompt=system_prompt_value)
+        # Make the LLM Call with retry mechanism
+        response_text = self._call_engine_with_retry(input_variable.value, system_prompt_value)
 
+        # Safely extract the final content
+        try:
+            final_content = response_text.split('<FINAL>')[1].split('</FINAL>')[0].strip()
+        except IndexError:
+            # If the response doesn't have the expected format, use the full response
+            logger.warning("Response doesn't contain <FINAL> tags, using full response", 
+                         extra={"response": response_text})
+            final_content = response_text.strip()
 
         # Create the response variable
         response = Variable(
-            value=response_text.split('<FINAL>')[1].split('</FINAL>')[0].strip(),
+            value=final_content,
             predecessors=[self.system_prompt, input_variable] if self.system_prompt else [input_variable],
             role_description=response_role_description
         )
@@ -340,9 +450,13 @@ class LLMCall_with_in_context_examples(LLMCall):
                                              system_prompt=system_prompt_value,
                                              in_context_examples=in_context_examples))
         
-        # Stopping creteria Could be improved, now is very ugly. 
-        if "The plan doesn't need to be improved" in response_text.split('<FINAL>')[1].split('</FINAL>')[0].strip():
-            response = None
+        # Stopping criteria - Check if optimization should be stopped
+        if "The plan doesn't need to be improved" in final_content:
+            # Instead of returning None, create a special stopping response
+            logger.info("Optimization stopping criteria met", extra={"final_content": final_content})
+            response.set_value("OPTIMIZATION_STOP")
+            # Add a flag to indicate this is a stopping response
+            response._is_stopping_response = True
 
         return response
 

@@ -40,7 +40,21 @@ class Variable:
             raise Exception("If the variable does not require grad, none of its predecessors should require grad."
                             f"In this case, following predecessors require grad: {_predecessor_requires_grad}")
         
-        assert type(value) in [str, bytes, int], "Value must be a string, int, or image (bytes). Got: {}".format(type(value))
+        if value is None:
+            raise ValueError(
+                f"Variable value cannot be None. This often indicates:\n"
+                f"1. An LLM API call failed or returned None\n"
+                f"2. A network error or timeout occurred\n"
+                f"3. API rate limiting or quota exceeded\n"
+                f"4. Content filtering blocked the response\n"
+                f"Please check your API configuration, network connection, and retry the operation."
+            )
+        
+        assert type(value) in [str, bytes, int], (
+            f"Value must be a string, int, or image (bytes). Got: {type(value)}.\n"
+            f"If you received this error after an LLM call, it may indicate an API failure.\n"
+            f"Consider adding retry logic or checking your API configuration."
+        )
         if isinstance(value, int):
             value = str(value)
         # We'll currently let "empty variables" slide, but we'll need to handle this better in the future.
