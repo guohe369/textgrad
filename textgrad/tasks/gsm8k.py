@@ -14,13 +14,13 @@ class GSM8K(Dataset):
         self.subset = subset
         assert split in ["train", "val", "test"]
         if split == "test":
-            self.data = load_dataset("gsm8k", subset, cache_dir=root, split="test[:300]")
+            self.data = load_dataset("openai/gsm8k", subset, cache_dir=None, split="test[:300]")
         elif split == "val":
             # Split the training set into half. Let the second half be the training set.
             # Let the first 100 samples be the validation set.
-            self.data = load_dataset("gsm8k", subset, cache_dir=root, split="train[:100]")
+            self.data = load_dataset("openai/gsm8k", subset, cache_dir=None, split="train[:100]")
         elif split == "train":
-            self.data = load_dataset("gsm8k", subset, cache_dir=root, split="train[100:]")
+            self.data = load_dataset("openai/gsm8k", subset, cache_dir=None, split="train[100:]")
         self.split = split
     
     def __getitem__(self, index):
@@ -48,7 +48,7 @@ class GSM8K_DSPy(GSM8K):
         if root is None:
             root = platformdirs.user_cache_dir("textgrad")
             
-        dataset = load_dataset("gsm8k", 'main', cache_dir=root)
+        dataset = load_dataset("openai/gsm8k", 'main', cache_dir=None)
         hf_official_train = dataset['train']
         hf_official_test = dataset['test']
         official_train = []
